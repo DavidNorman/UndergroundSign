@@ -2,7 +2,7 @@
   Code designed for a LOLIN S2 Mini, aka WEMOS ESP32S2 board.
 */
 
-#include <ArduinoJson.h>
+#include <cJSON.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <WiFi.h>
@@ -28,7 +28,7 @@
 #define PIN_D      GPIO_NUM_9
 #define PIN_CLK    GPIO_NUM_13
 #define PIN_LAT    GPIO_NUM_11
-#define PIN_OE     GPIO_NUM_12
+#define PIN_OE     GPIO_NUM_14
 
 /* Maximum number of lines on the screen.  64 lines high at 8 pixels per character */
 #define MAX_LINE_COUNT 4
@@ -44,10 +44,14 @@
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 32
 
+#define ONE_NOP {__asm__ __volatile__("nop");}
+
 /* Arduino classes for various functions */
 Preferences prefs;
 HTTPClient client;
 WiFiClientSecure net;
+
+esp_timer_handle_t refresh_timer;
 
 /* A screen buffer.  Pixels are either white or black so one bit per pixel */
 static unsigned char screen[SCREEN_HEIGHT/8][SCREEN_WIDTH];
@@ -60,8 +64,8 @@ struct Train {
 };
 std::vector<Train> trains;
 
-static char current_hours[2];
-static char current_mins[2];
+static unsigned int epoc_secs = 0;
+static unsigned long ref_secs = 0;
 
 /* The website certificate for the root of the TfL website chain,
    and the Time website chain */
@@ -272,48 +276,58 @@ static char east_train_sprite[] PROGMEM =  {
 
 /* FUNCTIONS */
 
-/* Zero out the screen pixels */
-void clear_screen() {
-  memset(screen, 0, sizeof(screen));
-}
-
 /* Render the screen out to the HUB75 interface */
-void draw_screen() {
+void IRAM_ATTR draw_screen(void*) {
+  static int a=0;
+
   noInterrupts();
 
-  for (uint32_t a=0; a<SCREEN_HEIGHT/2; a++) {
-    gpio_set_level(PIN_A, (a >> 0) & 0x1);
-    gpio_set_level(PIN_B, (a >> 1) & 0x1);
-    gpio_set_level(PIN_C, (a >> 2) & 0x1);
-    gpio_set_level(PIN_D, (a >> 3) & 0x1);
+  gpio_set_level(PIN_OE, 0);
+  ONE_NOP;
 
-    unsigned char mask = (0x01 << (a & 0x7));
-    unsigned char *row_1 = &screen[(a / 8) + 0][0];
-    unsigned char *row_2 = &screen[(a / 8) + 2][0];
+  gpio_set_level(PIN_A, (a >> 0) & 0x1);
+  gpio_set_level(PIN_B, (a >> 1) & 0x1);
+  gpio_set_level(PIN_C, (a >> 2) & 0x1);
+  gpio_set_level(PIN_D, (a >> 3) & 0x1);
 
-    for (uint32_t i=0; i<SCREEN_WIDTH; i++) {
-      uint32_t pix_1 = (*row_1++ & mask) ? 1 : 0;
-      uint32_t pix_2 = (*row_2++ & mask) ? 1 : 0;
+  unsigned char mask = (0x01 << (a & 0x7));
+  unsigned char *row_1 = &screen[(a / 8) + 0][0];
+  unsigned char *row_2 = &screen[(a / 8) + 2][0];
 
-      gpio_set_level(PIN_R1, pix_1);
-      gpio_set_level(PIN_B1, pix_1);
-      gpio_set_level(PIN_G1, pix_1);
-      gpio_set_level(PIN_R2, pix_2);
-      gpio_set_level(PIN_B2, pix_2);
-      gpio_set_level(PIN_G2, pix_2);
-      gpio_set_level(PIN_CLK, HIGH);
-      gpio_set_level(PIN_CLK, LOW);
-      gpio_set_level(PIN_R1, LOW);
-    }
+  for (uint32_t i=0; i<SCREEN_WIDTH; i++) {
+    uint32_t pix_1 = (*row_1++ & mask) ? 1 : 0;
+    uint32_t pix_2 = (*row_2++ & mask) ? 1 : 0;
 
-    gpio_set_level(PIN_LAT, HIGH);
-    gpio_set_level(PIN_LAT, LOW);
-    gpio_set_level(PIN_OE, 0);
-    delayMicroseconds(10);
-    gpio_set_level(PIN_OE, 1);
+    gpio_set_level(PIN_R1, pix_1);
+    gpio_set_level(PIN_B1, pix_1);
+    gpio_set_level(PIN_G1, pix_1);
+    gpio_set_level(PIN_R2, pix_2);
+    gpio_set_level(PIN_B2, pix_2);
+    gpio_set_level(PIN_G2, pix_2);
+    gpio_set_level(PIN_CLK, HIGH);
+    gpio_set_level(PIN_CLK, LOW);
+    gpio_set_level(PIN_R1, LOW);
   }
 
+  gpio_set_level(PIN_LAT, HIGH);
+  gpio_set_level(PIN_LAT, LOW);
+  ONE_NOP;
+  gpio_set_level(PIN_OE, 1);
+
+  if (++a >= SCREEN_HEIGHT/2) a = 0;
+
   interrupts();
+}
+
+/* Clear a range of one line */
+void clear_screen_line(int l, int s, int w) {
+  void* line = &screen[l][s];
+  memset(line, 0, w);
+}
+
+/* Zero out the screen pixels */
+void clear_screen() {
+  memset(&screen[0][0], 0, SCREEN_WIDTH * SCREEN_HEIGHT / 8);
 }
 
 /* Draw some text onto the screen buffer */
@@ -345,9 +359,38 @@ void print_sprite(uint32_t row, uint32_t col, const char* sprite) {
   }
 }
 
+/* Print only the time part of the screen */
+void print_clock() {
+  if (ref_secs > 0) {
+    unsigned long time_since_ref = millis() / 1000 - ref_secs;
+    unsigned long actual_secs = (epoc_secs + time_since_ref) % (60*60*24);
+
+    unsigned long secs = actual_secs % 60;
+    unsigned long mins = (actual_secs / 60) % 60;
+    unsigned long hours = (actual_secs / 3600) % 24;
+
+    clear_screen_line(3, 44, 42);
+
+    char buf[3];
+    buf[0] = (hours / 10) + '0';
+    buf[1] = (hours % 10) + '0';
+    print_string(3, 44, buf, 2);
+
+    buf[0] = (mins / 10) + '0';
+    buf[1] = (mins % 10) + '0';
+    print_string(3, 58, buf, 2);
+
+    buf[0] = (secs / 10) + '0';
+    buf[1] = (secs % 10) + '0';
+    print_string(3, 72, buf, 2);
+  }
+}
+
 /* Print the train list onto the screen buffer */
 void print_train_info(uint32_t page) {
   clear_screen();
+
+  print_clock();
 
   if (trains.size() == 0) {
     print_string(1, 43, "No trains");
@@ -373,42 +416,38 @@ void print_train_info(uint32_t page) {
       print_string(i, 110, arrival, 3);
     }
   }
-
-  print_string(3, 50, current_hours, sizeof(current_hours));
-  print_string(3, 64, current_mins, sizeof(current_mins));
 }
 
-/* Sort the train list - I tried using bsort and std::sort and neither worked
-   that well :shrug:
-*/
-void bubble_sort() {
-  bool done=false;
-  if (trains.size() < 2) return;
-
-  while (!done) {
-    done = true;
-    for(size_t i=0; i<trains.size()-1; i++) {
-      if (trains[i].minsToArrival > trains[i+1].minsToArrival) {
-        std::swap(trains[i], trains[i+1]);
-        done = false;
-      }
-    }
-  }
+/* Convert a 2 digit string to integer - without needing null terminator */
+unsigned char two_digit_convert(const char* digits) {
+  return (digits[0]-'0') * 10 + (digits[1]-'0');
 }
+
 
 /* Fetch the current time */
 void get_time_info() {
-  client.begin(net, "https://time.now/developer/api/timezone/Europe/London");
-  uint32_t httpCode = client.GET();
-  if (httpCode == 200) {
-      StaticJsonDocument<64> filter;
-      filter["datetime"] = true;
+  if (WiFi.status() == WL_CONNECTED) {
+    client.begin(net, "https://time.now/developer/api/timezone/Europe/London");
 
-      DynamicJsonDocument doc(1024);
-      deserializeJson(doc, client.getStream(), DeserializationOption::Filter(filter));
-      const char* str = doc["datetime"];
-      strncpy(current_hours, &str[11], sizeof(current_hours));
-      strncpy(current_mins, &str[14], sizeof(current_mins));
+    uint32_t httpCode = client.GET();
+    if (httpCode == 200) {
+      const char* json_string = client.getString().c_str();
+      cJSON *json = cJSON_Parse(json_string);
+      if (json) {
+        cJSON *datetime = cJSON_GetObjectItemCaseSensitive(json, "datetime");
+        if (datetime && cJSON_IsString(datetime)) {
+          const char* str = datetime->valuestring;
+          ref_secs = millis() / 1000;
+          unsigned char hour = two_digit_convert(&str[11]);
+          unsigned char min = two_digit_convert(&str[14]);
+          unsigned char sec = two_digit_convert(&str[17]);
+          epoc_secs = ((hour * 60) + min) * 60 + sec;
+        }
+
+        cJSON_Delete(json);
+      }
+    }
+    client.end();
   }
 }
 
@@ -422,35 +461,48 @@ void get_train_arrival_info() {
     if (httpCode == 200) {
       trains.clear();
       
-      StaticJsonDocument<64> filter;
-      filter[0]["timeToStation"] = true;
-      filter[0]["towards"] = true;
-      filter[0]["platformName"] = true;
+      cJSON *json = cJSON_Parse(client.getString().c_str());
 
-      DynamicJsonDocument doc(2048);
-      deserializeJson(doc, client.getStream(), DeserializationOption::Filter(filter));
+      if (json) {
+        bool parse_error = false;
+        uint32_t trainCount = cJSON_GetArraySize(json);
 
-      if (doc.is<JsonArray>()) {
-        JsonArray train_array = doc.as<JsonArray>();
+        trains.clear();
 
-        for(JsonVariant t : train_array) {
-          if (t.is<JsonObject>() &&
-              t.containsKey("timeToStation") &&
-              t.containsKey("towards") &&
-              t.containsKey("platformName")) {
-            uint32_t minsToArrival = t["timeToStation"].as<int>() / 60;
-            String towards = t["towards"];
-            if (minsToArrival < 20 && !towards.startsWith("Check")) {
-              bool westward = (t["platformName"].as<const char*>()[0] == 'W');
-              trains.push_back({towards, minsToArrival, westward});
+        for(uint32_t i=0; i<trainCount; i++) {
+          cJSON *train = cJSON_GetArrayItem(json, i);
+
+          cJSON *towards = cJSON_GetObjectItemCaseSensitive(train, "towards");
+          cJSON *eta = cJSON_GetObjectItemCaseSensitive(train, "timeToStation");
+          cJSON *platformName = cJSON_GetObjectItemCaseSensitive(train, "platformName");
+
+          if (towards && cJSON_IsString(towards) &&
+              eta && cJSON_IsNumber(eta) &&
+              platformName && cJSON_IsString(platformName)) {
+            uint32_t minsToArrival = eta->valueint /60;
+            if (minsToArrival < 20 && strncmp(towards->valuestring, "Check", 5) != 0) {
+              bool westward = (platformName->valuestring[0] == 'W');
+              trains.push_back({towards->valuestring, minsToArrival, westward});
             }
-          }     
+          } else {
+            parse_error = true;
+          }
         }
-        doc.clear();
+        cJSON_Delete(json);
+
+        if (parse_error) {
+          trains.clear();
+        }
       }
 
       client.end();
     }
+
+    std::sort(trains.begin(), trains.end(),
+      [](const Train&a, const Train& b) {
+        return a.minsToArrival > b.minsToArrival;
+      });
+
   }
 }
 
@@ -526,13 +578,23 @@ void setup() {
   /* Serial is used for getting wifi credentials */
   Serial.begin(115200);
 
+  /* Setup screen drawing timer */
+  const esp_timer_create_args_t timer_args = {
+    .callback = draw_screen,
+    .arg = NULL,
+    .dispatch_method = ESP_TIMER_TASK,
+    .name = "draw"
+  };
+  esp_timer_create(&timer_args, &refresh_timer);
+  esp_timer_start_periodic(refresh_timer, 600);
+
   /* WiFi init, using a certificate from the TfL site */
   WiFi.mode(WIFI_MODE_STA);
   //net.setInsecure();
-  net.setCACert(root_ca);
+  // net.setCACert(root_ca);
 
   /* Use HTTP 1.0 because we cannot handle chunked transfer encoding */
-  client.useHTTP10(true);
+  // client.useHTTP10(true);
 
   /* Fetch wifi creds and try to connect */
   prefs.begin("wifi", true);
@@ -556,42 +618,52 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t start = millis();
-  static uint32_t current_period = -1;
-  static bool need_update = true;
+  static unsigned long start_of_period = millis();
+  static unsigned long current_period = -1;
+  static bool need_train_update = true;
 
-  /* Without this loop something in the outer task causes a periodic flickering by changing
-     the return to the loop.  If this was a multi-core device I would probably put the drawing
-     code on the other core and let the Arduino+RTOS free */
-  while(1) {
-    draw_screen();
+  static unsigned long next_clock_update = 0;
+  static unsigned long next_clock_draw = 0;
 
-    /* Can force a drop to getting WiFi credentials by pressing button 0 */
-    if (gpio_get_level(PIN_BUTTON) == 0) {
-      write_wifi_details("", "");
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-      uint32_t period = (millis() - start) / 10000;
-
-      if (current_period != period) {
-        current_period = period;
-        if (period > 6) need_update = true;
-
-        if (need_update) {
-          get_time_info();
-          get_train_arrival_info();
-          bubble_sort();
-          start = millis();
-          period = 0;
-          need_update = false;
-        }
-
-        print_train_info(current_period);
-      }
-    } else {
-      handle_wifi_connection_details();
-    }
+  /* Can force a drop to getting WiFi credentials by pressing button 0 */
+  if (gpio_get_level(PIN_BUTTON) == 0) {
+    write_wifi_details("", "");
   }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    unsigned long now = millis();
+    unsigned long period = (now - start_of_period) / 10000;
+    bool update_screen = false;
+
+    if (next_clock_update < now) {
+      get_time_info();
+      next_clock_update = now + 3600000;
+    }
+
+    if (next_clock_draw < now) {
+      next_clock_draw = now + 1000;
+      print_clock();
+    }
+
+    if (current_period != period) {
+      if (period >= 6) need_train_update = true;
+
+      if (need_train_update) {
+        get_train_arrival_info();
+
+        start_of_period = now;
+        period = 0;
+        need_train_update = false;
+      }
+      current_period = period;
+      print_train_info(current_period);
+    }
+
+  } else {
+    handle_wifi_connection_details();
+  }
+
+  /* Yeild just in case it makes a difference */
+  delay(0);
 }
 
