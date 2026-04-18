@@ -51,7 +51,9 @@ Preferences prefs;
 HTTPClient client;
 WiFiClientSecure net;
 
-esp_timer_handle_t refresh_timer;
+/* Handles for the ESP32 clock task */
+esp_timer_handle_t screen_refresh_timer;
+esp_timer_handle_t clock_refresh_timer;
 
 /* A screen buffer.  Pixels are either white or black so one bit per pixel */
 static unsigned char screen[SCREEN_HEIGHT/8][SCREEN_WIDTH];
@@ -320,18 +322,18 @@ void IRAM_ATTR draw_screen(void*) {
 }
 
 /* Clear a range of one line */
-void clear_screen_line(int l, int s, int w) {
+void IRAM_ATTR clear_screen_line(int l, int s, int w) {
   void* line = &screen[l][s];
   memset(line, 0, w);
 }
 
 /* Zero out the screen pixels */
-void clear_screen() {
+void IRAM_ATTR clear_screen() {
   memset(&screen[0][0], 0, SCREEN_WIDTH * SCREEN_HEIGHT / 8);
 }
 
 /* Draw some text onto the screen buffer */
-void print_string(uint32_t row, uint32_t col, const char* str, size_t len=-1) {
+void IRAM_ATTR print_string(uint32_t row, uint32_t col, const char* str, size_t len=-1) {
   while (*str != 0 && len) {
     if (static_cast<unsigned char>(*str) < 128) {
       unsigned char *c = &font[ascii[*str] * 5];
@@ -360,7 +362,7 @@ void print_sprite(uint32_t row, uint32_t col, const char* sprite) {
 }
 
 /* Print only the time part of the screen */
-void print_clock() {
+void IRAM_ATTR print_clock(void*) {
   if (ref_secs > 0) {
     unsigned long time_since_ref = millis() / 1000 - ref_secs;
     unsigned long actual_secs = (epoc_secs + time_since_ref) % (60*60*24);
@@ -390,7 +392,7 @@ void print_clock() {
 void print_train_info(uint32_t page) {
   clear_screen();
 
-  print_clock();
+  print_clock(NULL);
 
   if (trains.size() == 0) {
     print_string(1, 43, "No trains");
@@ -466,7 +468,6 @@ void get_train_arrival_info() {
       if (json) {
         bool parse_error = false;
         uint32_t trainCount = cJSON_GetArraySize(json);
-
         trains.clear();
 
         for(uint32_t i=0; i<trainCount; i++) {
@@ -500,7 +501,7 @@ void get_train_arrival_info() {
 
     std::sort(trains.begin(), trains.end(),
       [](const Train&a, const Train& b) {
-        return a.minsToArrival > b.minsToArrival;
+        return a.minsToArrival < b.minsToArrival;
       });
 
   }
@@ -579,22 +580,31 @@ void setup() {
   Serial.begin(115200);
 
   /* Setup screen drawing timer */
-  const esp_timer_create_args_t timer_args = {
+  const esp_timer_create_args_t screen_timer_args = {
     .callback = draw_screen,
     .arg = NULL,
     .dispatch_method = ESP_TIMER_TASK,
     .name = "draw"
   };
-  esp_timer_create(&timer_args, &refresh_timer);
-  esp_timer_start_periodic(refresh_timer, 600);
+  esp_timer_create(&screen_timer_args, &screen_refresh_timer);
+  esp_timer_start_periodic(screen_refresh_timer, 600);
+
+  /* Setup clock update timer */
+  const esp_timer_create_args_t clock_timer_args = {
+    .callback = print_clock,
+    .arg = NULL,
+    .dispatch_method = ESP_TIMER_TASK,
+    .name = "clock"
+  };
+  esp_timer_create(&clock_timer_args, &clock_refresh_timer);
+  esp_timer_start_periodic(clock_refresh_timer, 1000000);
 
   /* WiFi init, using a certificate from the TfL site */
   WiFi.mode(WIFI_MODE_STA);
-  //net.setInsecure();
-  // net.setCACert(root_ca);
+  net.setCACert(root_ca);
 
   /* Use HTTP 1.0 because we cannot handle chunked transfer encoding */
-  // client.useHTTP10(true);
+  client.useHTTP10(true);
 
   /* Fetch wifi creds and try to connect */
   prefs.begin("wifi", true);
@@ -623,7 +633,6 @@ void loop() {
   static bool need_train_update = true;
 
   static unsigned long next_clock_update = 0;
-  static unsigned long next_clock_draw = 0;
 
   /* Can force a drop to getting WiFi credentials by pressing button 0 */
   if (gpio_get_level(PIN_BUTTON) == 0) {
@@ -638,11 +647,6 @@ void loop() {
     if (next_clock_update < now) {
       get_time_info();
       next_clock_update = now + 3600000;
-    }
-
-    if (next_clock_draw < now) {
-      next_clock_draw = now + 1000;
-      print_clock();
     }
 
     if (current_period != period) {
