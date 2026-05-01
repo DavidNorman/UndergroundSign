@@ -68,6 +68,11 @@ std::vector<Train> trains;
 
 static unsigned int epoc_secs = 0;
 static unsigned long ref_secs = 0;
+static char hour_string[2];
+static char min_string[2];
+static char sec_string[2];
+
+static bool wifi_connected = false;
 
 /* The website certificate for the root of the TfL website chain,
    and the Time website chain */
@@ -362,7 +367,17 @@ void print_sprite(uint32_t row, uint32_t col, const char* sprite) {
 }
 
 /* Print only the time part of the screen */
-void IRAM_ATTR print_clock(void*) {
+void IRAM_ATTR print_clock() {
+  if (ref_secs > 0) {
+    clear_screen_line(3, 44, 42);
+    print_string(3, 44, hour_string, 2);
+    print_string(3, 58, min_string, 2);
+    print_string(3, 72, sec_string, 2);
+  }
+}
+
+/* Print only the time part of the screen */
+void IRAM_ATTR update_clock(void*) {
   if (ref_secs > 0) {
     unsigned long time_since_ref = millis() / 1000 - ref_secs;
     unsigned long actual_secs = (epoc_secs + time_since_ref) % (60*60*24);
@@ -371,20 +386,16 @@ void IRAM_ATTR print_clock(void*) {
     unsigned long mins = (actual_secs / 60) % 60;
     unsigned long hours = (actual_secs / 3600) % 24;
 
-    clear_screen_line(3, 44, 42);
+    hour_string[0] = (hours / 10) + '0';
+    hour_string[1] = (hours % 10) + '0';
 
-    char buf[3];
-    buf[0] = (hours / 10) + '0';
-    buf[1] = (hours % 10) + '0';
-    print_string(3, 44, buf, 2);
+    min_string[0] = (mins / 10) + '0';
+    min_string[1] = (mins % 10) + '0';
 
-    buf[0] = (mins / 10) + '0';
-    buf[1] = (mins % 10) + '0';
-    print_string(3, 58, buf, 2);
+    sec_string[0] = (secs / 10) + '0';
+    sec_string[1] = (secs % 10) + '0';
 
-    buf[0] = (secs / 10) + '0';
-    buf[1] = (secs % 10) + '0';
-    print_string(3, 72, buf, 2);
+    print_clock();
   }
 }
 
@@ -392,7 +403,7 @@ void IRAM_ATTR print_clock(void*) {
 void print_train_info(uint32_t page) {
   clear_screen();
 
-  print_clock(NULL);
+  print_clock();
 
   if (trains.size() == 0) {
     print_string(1, 43, "No trains");
@@ -428,83 +439,77 @@ unsigned char two_digit_convert(const char* digits) {
 
 /* Fetch the current time */
 void get_time_info() {
-  if (WiFi.status() == WL_CONNECTED) {
-    client.begin(net, "https://time.now/developer/api/timezone/Europe/London");
+  client.begin(net, "https://time.now/developer/api/timezone/Europe/London");
 
-    uint32_t httpCode = client.GET();
-    if (httpCode == 200) {
-      const char* json_string = client.getString().c_str();
-      cJSON *json = cJSON_Parse(json_string);
-      if (json) {
-        cJSON *datetime = cJSON_GetObjectItemCaseSensitive(json, "datetime");
-        if (datetime && cJSON_IsString(datetime)) {
-          const char* str = datetime->valuestring;
-          ref_secs = millis() / 1000;
-          unsigned char hour = two_digit_convert(&str[11]);
-          unsigned char min = two_digit_convert(&str[14]);
-          unsigned char sec = two_digit_convert(&str[17]);
-          epoc_secs = ((hour * 60) + min) * 60 + sec;
-        }
-
-        cJSON_Delete(json);
+  uint32_t httpCode = client.GET();
+  if (httpCode == 200) {
+    const char* json_string = client.getString().c_str();
+    cJSON *json = cJSON_Parse(json_string);
+    if (json) {
+      cJSON *datetime = cJSON_GetObjectItemCaseSensitive(json, "datetime");
+      if (datetime && cJSON_IsString(datetime)) {
+        const char* str = datetime->valuestring;
+        unsigned char hour = two_digit_convert(&str[11]);
+        unsigned char min = two_digit_convert(&str[14]);
+        unsigned char sec = two_digit_convert(&str[17]);
+        ref_secs = millis() / 1000;
+        epoc_secs = ((hour * 60) + min) * 60 + sec;
       }
+
+      cJSON_Delete(json);
     }
-    client.end();
   }
+  client.end();
 }
 
 /* Fetch the Plaistow train info - hardcoded the naptan which is 940GZZLUPLW */
 void get_train_arrival_info() {
-  if (WiFi.status() == WL_CONNECTED) {
+  trains.clear();
 
-    client.begin(net, "https://api.tfl.gov.uk/StopPoint/940GZZLUPLW/Arrivals");
+  client.begin(net, "https://api.tfl.gov.uk/StopPoint/940GZZLUPLW/Arrivals");
 
-    uint32_t httpCode = client.GET();
-    if (httpCode == 200) {
-      trains.clear();
-      
-      cJSON *json = cJSON_Parse(client.getString().c_str());
+  uint32_t httpCode = client.GET();
+  if (httpCode == 200) {    
+    cJSON *json = cJSON_Parse(client.getString().c_str());
 
-      if (json) {
-        bool parse_error = false;
-        uint32_t trainCount = cJSON_GetArraySize(json);
-        trains.clear();
+    if (json) {
+      bool parse_error = false;
+      uint32_t trainCount = cJSON_GetArraySize(json);
 
-        for(uint32_t i=0; i<trainCount; i++) {
-          cJSON *train = cJSON_GetArrayItem(json, i);
+      for(uint32_t i=0; i<trainCount; i++) {
+        cJSON *train = cJSON_GetArrayItem(json, i);
 
-          cJSON *towards = cJSON_GetObjectItemCaseSensitive(train, "towards");
-          cJSON *eta = cJSON_GetObjectItemCaseSensitive(train, "timeToStation");
-          cJSON *platformName = cJSON_GetObjectItemCaseSensitive(train, "platformName");
+        cJSON *towards = cJSON_GetObjectItemCaseSensitive(train, "towards");
+        cJSON *eta = cJSON_GetObjectItemCaseSensitive(train, "timeToStation");
+        cJSON *platformName = cJSON_GetObjectItemCaseSensitive(train, "platformName");
 
-          if (towards && cJSON_IsString(towards) &&
-              eta && cJSON_IsNumber(eta) &&
-              platformName && cJSON_IsString(platformName)) {
-            uint32_t minsToArrival = eta->valueint /60;
-            if (minsToArrival < 20 && strncmp(towards->valuestring, "Check", 5) != 0) {
-              bool westward = (platformName->valuestring[0] == 'W');
-              trains.push_back({towards->valuestring, minsToArrival, westward});
-            }
-          } else {
-            parse_error = true;
+        if (towards && cJSON_IsString(towards) &&
+            eta && cJSON_IsNumber(eta) &&
+            platformName && cJSON_IsString(platformName)) {
+          uint32_t minsToArrival = eta->valueint /60;
+          if (minsToArrival < 20 && strncmp(towards->valuestring, "Check", 5) != 0) {
+            bool westward = (platformName->valuestring[0] == 'W');
+            trains.push_back({towards->valuestring, minsToArrival, westward});
           }
-        }
-        cJSON_Delete(json);
-
-        if (parse_error) {
-          trains.clear();
+        } else {
+          parse_error = true;
         }
       }
+      cJSON_Delete(json);
 
-      client.end();
+      if (parse_error) {
+        trains.clear();
+      }
     }
 
-    std::sort(trains.begin(), trains.end(),
-      [](const Train&a, const Train& b) {
-        return a.minsToArrival < b.minsToArrival;
-      });
-
+    client.end();
   }
+
+  std::sort(trains.begin(), trains.end(),
+    [](const Train&a, const Train& b) {
+      return a.minsToArrival < b.minsToArrival;
+    });
+
 }
 
 /* Store off the WiFi details to flash and restart the board */
@@ -591,7 +596,7 @@ void setup() {
 
   /* Setup clock update timer */
   const esp_timer_create_args_t clock_timer_args = {
-    .callback = print_clock,
+    .callback = update_clock,
     .arg = NULL,
     .dispatch_method = ESP_TIMER_TASK,
     .name = "clock"
@@ -624,6 +629,8 @@ void setup() {
   if (WiFi.status() != WL_CONNECTED) {
     clear_screen();
     print_string(1, 17, "Enter wifi details");
+  } else {
+    wifi_connected = true;
   }
 }
 
@@ -663,7 +670,11 @@ void loop() {
       print_train_info(current_period);
     }
 
+  } else if (wifi_connected) {
+    /* We were connected and now we are not - reset */
+    ESP.restart();
   } else {
+    /* We have never been connected - wait for Wifi credentials */
     handle_wifi_connection_details();
   }
 
