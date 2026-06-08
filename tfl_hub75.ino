@@ -2,9 +2,12 @@
   Code designed for a LOLIN S2 Mini, aka WEMOS ESP32S2 board.
 */
 
+
 #include <cJSON.h>
+#include <DNSServer.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
+#include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Wire.h>
@@ -50,6 +53,8 @@
 Preferences prefs;
 HTTPClient client;
 WiFiClientSecure net;
+WebServer server(80);
+DNSServer dns;
 
 /* Handles for the ESP32 clock task */
 esp_timer_handle_t screen_refresh_timer;
@@ -281,6 +286,17 @@ static char east_train_sprite[] PROGMEM =  {
   0x11, 0x31, 0x51, 0x31, 0x11, 0x13, 0x35, 0x55, 0x35, 0x1e, 0x80
 };
 
+/* Web page for configuring WiFi details */
+static const char html_form[] =
+"<html><body>"
+"<h3>Enter your WiFi details</h3>"
+"<form method='POST' action='/save'>"
+"SSID:<br><input name='s'><br>"
+"Password:<br><input name='p' type='password'><br><br>"
+"<input type='submit'>"
+"</form>"
+"</body></html>";
+
 /* FUNCTIONS */
 
 /* Render the screen out to the HUB75 interface */
@@ -339,7 +355,7 @@ void IRAM_ATTR clear_screen() {
 
 /* Draw some text onto the screen buffer */
 void IRAM_ATTR print_string(uint32_t row, uint32_t col, const char* str, size_t len=-1) {
-  while (*str != 0 && len) {
+  while (len && (*str != 0)) {
     if (static_cast<unsigned char>(*str) < 128) {
       unsigned char *c = &font[ascii[*str] * 5];
 
@@ -443,8 +459,8 @@ void get_time_info() {
 
   uint32_t httpCode = client.GET();
   if (httpCode == 200) {
-    const char* json_string = client.getString().c_str();
-    cJSON *json = cJSON_Parse(json_string);
+    String json_string = client.getString();
+    cJSON *json = cJSON_Parse(json_string.c_str());
     if (json) {
       cJSON *datetime = cJSON_GetObjectItemCaseSensitive(json, "datetime");
       if (datetime && cJSON_IsString(datetime)) {
@@ -469,8 +485,9 @@ void get_train_arrival_info() {
   client.begin(net, "https://api.tfl.gov.uk/StopPoint/940GZZLUPLW/Arrivals");
 
   uint32_t httpCode = client.GET();
-  if (httpCode == 200) {    
-    cJSON *json = cJSON_Parse(client.getString().c_str());
+  if (httpCode == 200) {
+    String json_string = client.getString();
+    cJSON *json = cJSON_Parse(json_string.c_str());
 
     if (json) {
       bool parse_error = false;
@@ -501,9 +518,8 @@ void get_train_arrival_info() {
         trains.clear();
       }
     }
-
-    client.end();
   }
+  client.end();
 
   std::sort(trains.begin(), trains.end(),
     [](const Train&a, const Train& b) {
@@ -523,29 +539,24 @@ void write_wifi_details(const String& ssid, const String& pass) {
       ESP.restart();
 }
 
-/* If we are in 'getting the WiFi details mode, read the details from serial port and save to flash */
-void handle_wifi_connection_details() {
-  static String line;
+/* Start the board as a web server when there are no WiFi connection details */
+void handle_root() {
+  server.send(200, "text/html", html_form);
+}
 
-  if (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\n' || c == '\r') {
-      line.trim();
-      if (line.length()) {
+void handle_save() {
+  String ssid = server.arg("s");
+  String pass = server.arg("p");
 
-        // Parse into two tokens: SSID + PASSWORD
-        uint32_t space = line.indexOf(' ');
-        if (space < 1) {
-          line = "";
-          return;
-        }
+  server.send(200, "text/html", "Saved. Rebooting...");
+  delay(500);
 
-        write_wifi_details(line.substring(0, space), line.substring(space + 1));
-      }
-    } else {
-      line += c;
-    }
-  }
+  write_wifi_details(ssid, pass);
+}
+
+void handle_not_found() {
+  server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString(), true);
+  server.send(302, "text/plain", "");
 }
 
 /* Setup board, GPIOS, WiFi, etc*/
@@ -580,9 +591,6 @@ void setup() {
     .intr_type = GPIO_INTR_DISABLE
   };
   gpio_config(&io_conf_ip);
-
-  /* Serial is used for getting wifi credentials */
-  Serial.begin(115200);
 
   /* Setup screen drawing timer */
   const esp_timer_create_args_t screen_timer_args = {
@@ -628,7 +636,18 @@ void setup() {
 
   if (WiFi.status() != WL_CONNECTED) {
     clear_screen();
-    print_string(1, 17, "Enter wifi details");
+    print_string(1, 17, "Connect to WiFi TB to configure");
+
+    WiFi.mode(WIFI_MODE_AP);
+    WiFi.softAP("TB");
+
+    dns.start(53, "*", WiFi.softAPIP());
+
+    server.on("/", handle_root);
+    server.on("/save", HTTP_POST, handle_save);
+    server.onNotFound(handle_not_found);
+
+    server.begin();
   } else {
     wifi_connected = true;
   }
@@ -675,7 +694,8 @@ void loop() {
     ESP.restart();
   } else {
     /* We have never been connected - wait for Wifi credentials */
-    handle_wifi_connection_details();
+    dns.processNextRequest();
+    server.handleClient();
   }
 
   /* Yeild just in case it makes a difference */
