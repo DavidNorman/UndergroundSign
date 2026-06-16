@@ -636,7 +636,8 @@ void setup() {
 
   if (WiFi.status() != WL_CONNECTED) {
     clear_screen();
-    print_string(1, 17, "Connect to WiFi TB to configure");
+    print_string(1, 17, "Connect to WiFi TB");
+    print_string(2, 30, "to configure");
 
     WiFi.mode(WIFI_MODE_AP);
     WiFi.softAP("TB");
